@@ -52,22 +52,30 @@ class ReviewService:
         from story_patterns.review.readiness import build_review_queue, queue_totals
 
         minimum = validate_minimum(minimum_reviewers)
-        stories, decisions, _origins, adjudications = self.store.analysis_snapshot(tradition)
-        rows = build_review_queue(select_cohort(stories, tradition), decisions, minimum, adjudications)
+        stories, decisions, _origins, adjudications, withdrawn = self.store.analysis_snapshot(tradition)
+        rows = build_review_queue(select_cohort(stories, tradition), decisions, minimum, adjudications, withdrawn)
         return {"minimum_reviewers": minimum, "total": len(rows), "by_status": queue_totals(rows), "stories": rows}
 
     def record_adjudication(self, record: dict) -> dict:
         return self.adjudications.record(record)
+
+    def withdraw_adjudication(self, record: dict) -> dict:
+        return self.adjudications.withdraw(record)
 
     def history(self, story_id: str, revision: int) -> dict:
         from story_patterns.errors import NotFoundError
 
         if self.store.story_document(story_id, revision) is None:
             raise NotFoundError(f"story revision {story_id!r}/{revision!r} was not found")
-        votes, adjudications = self.store.decision_history(story_id, revision)
+        votes, adjudications, withdrawals = self.store.decision_history(story_id, revision)
         latest_by_reader = {item["annotator"]: item["sequence"] for item in votes}
         for item in votes:
             item["current"] = item["sequence"] == latest_by_reader[item["annotator"]]
+        withdrawal_by_adjudication = {item["adjudication_id"]: item for item in withdrawals}
+        for item in adjudications:
+            item["status"] = "withdrawn" if item["adjudication_id"] in withdrawal_by_adjudication else "active"
+            item["withdrawal"] = withdrawal_by_adjudication.get(item["adjudication_id"])
+        active = self.store.active_adjudication(story_id, revision)
         return {"story_id": story_id, "revision": revision, "decisions": votes,
-                "adjudications": adjudications,
-                "active_adjudication_id": adjudications[-1]["adjudication_id"] if adjudications else None}
+                "adjudications": adjudications, "withdrawals": withdrawals,
+                "active_adjudication_id": active["adjudication_id"] if active else None}

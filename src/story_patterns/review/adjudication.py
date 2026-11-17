@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from story_patterns.catalog.validate import canonical_json, digest_json, _text
 from story_patterns.errors import ConflictError, NotFoundError, ValidationError
 
@@ -33,6 +35,34 @@ def normalize_adjudication(raw: dict, story: dict) -> dict:
         "moderator": moderator, "sequence": sequence, "pattern": pattern,
         "youngest_outcome": outcome, "evidence_event_ids": sorted(evidence),
         "rationale": rationale,
+    }
+
+
+def _timestamp(value) -> str:
+    if value is None:
+        moment = datetime.now(timezone.utc)
+    elif isinstance(value, str) and value.strip():
+        try:
+            moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValidationError("recorded_at must be an ISO-8601 timestamp") from error
+        if moment.tzinfo is None:
+            raise ValidationError("recorded_at must include a UTC offset")
+        moment = moment.astimezone(timezone.utc)
+    else:
+        raise ValidationError("recorded_at must be an ISO-8601 timestamp")
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_withdrawal(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ValidationError("withdrawal must be an object")
+    return {
+        "withdrawal_id": _text(raw.get("withdrawal_id"), "withdrawal_id", 120),
+        "adjudication_id": _text(raw.get("adjudication_id"), "adjudication_id", 120),
+        "moderator": _text(raw.get("moderator"), "moderator", 120),
+        "reason": _text(raw.get("reason"), "reason", 1500),
+        "recorded_at": _timestamp(raw.get("recorded_at")),
     }
 
 
@@ -70,3 +100,58 @@ class AdjudicationService:
                  record["rationale"], digest),
             )
         return {"adjudication_id": record["adjudication_id"], "status": "recorded"}
+
+    def withdraw(self, raw: dict) -> dict:
+        """Retire one adjudication without deleting it or promoting an older one."""
+        record = normalize_withdrawal(raw)
+        digest = digest_json(record)
+        with self.store.transaction() as connection:
+            previous = connection.execute(
+                "SELECT adjudication_id, moderator, reason, recorded_at FROM adjudication_withdrawals "
+                "WHERE withdrawal_id=?", (record["withdrawal_id"],)
+            ).fetchone()
+            if previous:
+                same_request = (
+                    previous["adjudication_id"] == record["adjudication_id"]
+                    and previous["moderator"] == record["moderator"]
+                    and previous["reason"] == record["reason"]
+                    and (raw.get("recorded_at") is None or previous["recorded_at"] == record["recorded_at"])
+                )
+                if not same_request:
+                    raise ConflictError("withdrawal identifier already refers to different content")
+                return {"withdrawal_id": record["withdrawal_id"], "status": "already_recorded"}
+            adjudication = connection.execute(
+                "SELECT story_id, story_revision, sequence FROM adjudications WHERE adjudication_id=?",
+                (record["adjudication_id"],),
+            ).fetchone()
+            if adjudication is None:
+                raise NotFoundError(f"adjudication {record['adjudication_id']!r} was not found")
+            existing = connection.execute(
+                "SELECT withdrawal_id FROM adjudication_withdrawals WHERE adjudication_id=?",
+                (record["adjudication_id"],),
+            ).fetchone()
+            if existing:
+                raise ConflictError(
+                    f"adjudication {record['adjudication_id']} was already withdrawn by {existing['withdrawal_id']}"
+                )
+            latest = connection.execute(
+                "SELECT adjudication_id FROM adjudications WHERE story_id=? AND story_revision=? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (adjudication["story_id"], adjudication["story_revision"]),
+            ).fetchone()
+            if latest["adjudication_id"] != record["adjudication_id"]:
+                raise ConflictError(
+                    "only the most recent adjudication for a story revision can be withdrawn; "
+                    "record a corrective adjudication instead"
+                )
+            connection.execute(
+                "INSERT INTO adjudication_withdrawals(withdrawal_id, adjudication_id, moderator, reason, "
+                "recorded_at, digest) VALUES(?,?,?,?,?,?)",
+                (record["withdrawal_id"], record["adjudication_id"], record["moderator"],
+                 record["reason"], record["recorded_at"], digest),
+            )
+        return {
+            "withdrawal_id": record["withdrawal_id"],
+            "adjudication_id": record["adjudication_id"],
+            "status": "withdrawn",
+        }

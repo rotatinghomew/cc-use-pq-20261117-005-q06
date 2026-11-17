@@ -5,7 +5,8 @@ from collections import defaultdict
 from story_patterns.analysis.report import build_report
 
 
-def compare_traditions(stories: list[dict], decisions: dict, minimum: int, adjudications: dict | None = None) -> dict:
+def compare_traditions(stories: list[dict], decisions: dict, minimum: int, adjudications: dict | None = None,
+                       withdrawn: dict | None = None) -> dict:
     grouped = defaultdict(list)
     for story in stories:
         grouped[story["tradition"]].append(story)
@@ -15,8 +16,9 @@ def compare_traditions(stories: list[dict], decisions: dict, minimum: int, adjud
         identities = {(item["story_id"], item["revision"]) for item in cohort}
         cohort_decisions = {identity: decisions.get(identity, []) for identity in identities}
         cohort_adjudications = {identity: adjudications.get(identity) for identity in identities} if adjudications else None
+        cohort_withdrawn = {identity: withdrawn.get(identity) for identity in identities} if withdrawn else None
         summary = build_report(cohort, cohort_decisions, tradition, minimum,
-                               adjudications=cohort_adjudications)
+                               adjudications=cohort_adjudications, withdrawn=cohort_withdrawn)
         pattern_denominator = summary["population"]["pattern_consensus"]
         outcome_denominator = summary["population"]["outcome_consensus"]
         final_pattern_denominator = sum(summary["final_pattern_counts"].values())

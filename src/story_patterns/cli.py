@@ -32,6 +32,10 @@ def parser() -> argparse.ArgumentParser:
     adjudicator = commands.add_parser("adjudicate", help="record a moderator resolution separately from votes")
     adjudicator.add_argument("--database", required=True)
     adjudicator.add_argument("--file", required=True)
+    withdrawal = commands.add_parser(
+        "withdraw-adjudication", help="retract one adjudication with a recorded reason without deleting it")
+    withdrawal.add_argument("--database", required=True)
+    withdrawal.add_argument("--file", required=True)
     history = commands.add_parser("history", help="inspect all reader and moderator revisions")
     history.add_argument("--database", required=True)
     history.add_argument("--story-id", required=True)
@@ -88,6 +92,8 @@ def execute(arguments: argparse.Namespace) -> dict:
         return app.record_decision(read_json(arguments.file))
     if arguments.command == "adjudicate":
         return app.record_adjudication(read_json(arguments.file))
+    if arguments.command == "withdraw-adjudication":
+        return app.withdraw_adjudication(read_json(arguments.file))
     if arguments.command == "history":
         return app.review_history(arguments.story_id, arguments.revision)
     if arguments.command == "report":

@@ -20,6 +20,14 @@ def adjudication(story_id="tale-a", revision=1, record_id="resolution-1", sequen
     }
 
 
+def withdrawal(adjudication_id="resolution-1", record_id="withdrawal-1", reason="事件证据后来被证实不可靠",
+               recorded_at="2026-11-17T09:30:00Z"):
+    return {
+        "withdrawal_id": record_id, "adjudication_id": adjudication_id,
+        "moderator": "editor-2", "reason": reason, "recorded_at": recorded_at,
+    }
+
+
 class PreviewAndCatalogHistoryTests(AppCase, unittest.TestCase):
     def test_preview_collects_separate_row_errors_and_identifies_batch_duplicates(self):
         malformed = story("invalid")
@@ -224,6 +232,160 @@ class AdjudicationLifecycleTests(AppCase, unittest.TestCase):
         self.assertIn("Independent-reader consensus counts", markdown)
         self.assertIn("Final pattern counts", markdown)
         self.assertIn(report["report_id"], markdown)
+
+
+class AdjudicationWithdrawalTests(AppCase, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.import_story()
+        self.add_votes(values=[
+            decision(annotator="reader-a", pattern="parallel", outcome="wins"),
+            decision(annotator="reader-b", pattern="harm", outcome="loses"),
+        ])
+        self.app.record_adjudication(adjudication())
+
+    def test_withdrawal_is_recorded_separately_and_retains_the_original_resolution(self):
+        result = self.app.withdraw_adjudication(withdrawal())
+        self.assertEqual(result["status"], "withdrawn")
+        history = self.app.review_history("tale-a", 1)
+        self.assertEqual(len(history["adjudications"]), 1)
+        self.assertEqual(history["adjudications"][0]["adjudication_id"], "resolution-1")
+        self.assertEqual(history["adjudications"][0]["pattern"], "harm")
+        self.assertEqual(history["adjudications"][0]["status"], "withdrawn")
+        self.assertEqual(history["withdrawals"], [{
+            "withdrawal_id": "withdrawal-1", "adjudication_id": "resolution-1",
+            "moderator": "editor-2", "reason": "事件证据后来被证实不可靠",
+            "recorded_at": "2026-11-17T09:30:00Z",
+            "digest": history["withdrawals"][0]["digest"],
+        }])
+        self.assertIsNone(history["active_adjudication_id"])
+
+    def test_withdrawn_resolution_leaves_queue_and_report_without_a_final_verdict(self):
+        self.app.withdraw_adjudication(withdrawal())
+        queue = self.app.review_queue()
+        row = queue["stories"][0]
+        self.assertEqual(row["status"], "reopened")
+        self.assertIsNone(row["adjudication_id"])
+        self.assertIsNone(row["final_pattern"])
+        self.assertEqual(row["withdrawn_adjudication_id"], "resolution-1")
+        self.assertEqual(queue["by_status"]["adjudicated"], 0)
+        self.assertEqual(queue["by_status"]["reopened"], 1)
+        report = self.app.create_report()
+        self.assertEqual(report["resolution_counts"], {
+            "reader_consensus": 0, "adjudicated": 0, "withdrawn": 1})
+        self.assertEqual(report["adjudicated_story_revisions"], 0)
+        self.assertEqual(report["withdrawn_adjudications"], ["resolution-1"])
+        self.assertNotIn("harm", report["final_pattern_counts"])
+        self.assertNotIn("loses", report["final_outcome_counts"])
+        self.assertEqual(report["provenance"]["adjudication_ids"], [])
+        self.assertEqual(report["provenance"]["withdrawn_adjudication_ids"], ["resolution-1"])
+
+    def test_retrying_the_same_withdrawal_is_idempotent_but_changed_content_conflicts(self):
+        record = withdrawal()
+        self.assertEqual(self.app.withdraw_adjudication(record)["status"], "withdrawn")
+        self.assertEqual(self.app.withdraw_adjudication(record)["status"], "already_recorded")
+        for changed in (withdrawal(reason="另一个理由"), withdrawal(record_id="withdrawal-2"),
+                        withdrawal(record_id="withdrawal-1", recorded_at="2026-11-18T00:00:00Z")):
+            with self.subTest(changed=changed):
+                with self.assertRaises(ConflictError):
+                    self.app.withdraw_adjudication(changed)
+        self.assertEqual(len(self.app.review_history("tale-a", 1)["withdrawals"]), 1)
+
+    def test_corrective_adjudication_supersedes_a_withdrawn_one(self):
+        self.app.withdraw_adjudication(withdrawal())
+        corrected = adjudication(record_id="resolution-2", sequence=2, pattern="parallel", outcome="wins")
+        self.app.record_adjudication(corrected)
+        queue = self.app.review_queue()
+        self.assertEqual(queue["stories"][0]["status"], "adjudicated")
+        self.assertEqual(queue["stories"][0]["final_pattern"], "parallel")
+        report = self.app.create_report()
+        self.assertEqual(report["resolution_counts"]["adjudicated"], 1)
+        self.assertEqual(report["resolution_counts"]["withdrawn"], 0)
+        self.assertEqual(report["final_pattern_counts"], {"parallel": 1})
+        self.assertEqual(report["provenance"]["adjudication_ids"], ["resolution-2"])
+        self.assertEqual(report["provenance"]["withdrawn_adjudication_ids"], [])
+        history = self.app.review_history("tale-a", 1)
+        self.assertEqual([item["status"] for item in history["adjudications"]], ["withdrawn", "active"])
+
+    def test_consecutive_corrections_count_only_the_latest_active_one(self):
+        self.app.withdraw_adjudication(withdrawal())
+        self.app.record_adjudication(adjudication(record_id="resolution-2", sequence=2, pattern="parallel"))
+        self.app.record_adjudication(adjudication(record_id="resolution-3", sequence=3, pattern="harm"))
+        report = self.app.create_report()
+        self.assertEqual(report["final_pattern_counts"], {"harm": 1})
+        self.assertEqual(report["provenance"]["adjudication_ids"], ["resolution-3"])
+        self.assertEqual(report["adjudicated_story_revisions"], 1)
+
+    def test_withdrawing_an_already_superseded_adjudication_is_refused(self):
+        self.app.record_adjudication(adjudication(record_id="resolution-2", sequence=2, pattern="parallel"))
+        with self.assertRaises(ConflictError):
+            self.app.withdraw_adjudication(withdrawal(adjudication_id="resolution-1"))
+        report = self.app.create_report()
+        self.assertEqual(report["final_pattern_counts"], {"parallel": 1})
+        self.assertEqual(report["provenance"]["adjudication_ids"], ["resolution-2"])
+
+    def test_only_the_latest_adjudication_can_be_withdrawn_and_never_reactivates_an_older_one(self):
+        self.app.record_adjudication(adjudication(record_id="resolution-2", sequence=2, pattern="parallel"))
+        self.app.withdraw_adjudication(withdrawal(adjudication_id="resolution-2"))
+        history = self.app.review_history("tale-a", 1)
+        self.assertIsNone(history["active_adjudication_id"])
+        report = self.app.create_report()
+        self.assertEqual(report["resolution_counts"]["withdrawn"], 1)
+        self.assertEqual(report["final_pattern_counts"], {})
+        with self.assertRaises(ConflictError):
+            self.app.withdraw_adjudication(withdrawal(adjudication_id="resolution-1",
+                                                      record_id="withdrawal-2"))
+
+    def test_withdrawal_requires_existing_adjudication_and_valid_record(self):
+        with self.assertRaises(NotFoundError):
+            self.app.withdraw_adjudication(withdrawal(adjudication_id="absent"))
+        for record in [withdrawal(recorded_at="2026-11-17 09:30"),
+                       withdrawal(recorded_at="2026-11-17T09:30:00"),
+                       withdrawal(reason=" "),
+                       withdrawal(record_id="")]:
+            with self.subTest(record=record):
+                with self.assertRaises(ValidationError):
+                    self.app.withdraw_adjudication(record)
+        self.assertEqual(self.app.review_history("tale-a", 1)["withdrawals"], [])
+
+    def test_previous_report_snapshot_survives_withdrawal_and_new_report_excludes_the_verdict(self):
+        before = self.app.create_report()
+        self.app.withdraw_adjudication(withdrawal())
+        stored = self.app.stored_report(before["report_id"])
+        self.assertEqual(stored["final_pattern_counts"], {"harm": 1})
+        self.assertEqual(stored["story_results"][0]["resolution"], "adjudicated")
+        after = self.app.create_report()
+        self.assertNotEqual(after["report_id"], before["report_id"])
+        self.assertEqual(after["final_pattern_counts"], {})
+        self.assertTrue(self.app.audit()["ok"])
+
+    def test_story_revision_does_not_inherit_or_erase_the_withdrawal(self):
+        revised = story(revision=2)
+        self.app.import_batch(batch([revised], "revision-two"))
+        self.app.withdraw_adjudication(withdrawal())
+        queue = {row["revision"]: row for row in self.app.review_queue()["stories"]}
+        self.assertEqual(queue[1]["status"], "reopened")
+        self.assertEqual(queue[2]["status"], "unreviewed")
+        self.assertIsNone(queue[2]["withdrawn_adjudication_id"])
+        report = {row["revision"]: row for row in self.app.create_report()["story_results"]}
+        self.assertEqual(report[1]["resolution"], "withdrawn")
+        self.assertEqual(report[2]["resolution"], "reader_consensus")
+
+    def test_audit_detects_withdrawal_tampering(self):
+        self.app.withdraw_adjudication(withdrawal())
+        self.assertTrue(self.app.audit()["ok"])
+        with self.app.store.transaction() as connection:
+            connection.execute("UPDATE adjudication_withdrawals SET reason='altered'")
+        result = self.app.audit()
+        self.assertFalse(result["ok"])
+        self.assertTrue(any(item["scope"] == "withdrawal" for item in result["issues"]))
+
+    def test_markdown_report_names_the_withdrawn_adjudication(self):
+        self.app.withdraw_adjudication(withdrawal())
+        markdown = render_report(self.app.create_report())
+        self.assertIn("Withdrawn adjudications", markdown)
+        self.assertIn("resolution-1", markdown)
+        self.assertNotIn("| harm | 1 |", markdown)
 
 
 if __name__ == "__main__":

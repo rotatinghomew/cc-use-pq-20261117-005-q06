@@ -40,6 +40,9 @@ class StoryPatternApplication:
     def record_adjudication(self, record: dict) -> dict:
         return self.review.record_adjudication(record)
 
+    def withdraw_adjudication(self, record: dict) -> dict:
+        return self.review.withdraw_adjudication(record)
+
     def compare_traditions(self, minimum_reviewers: int = 2) -> dict:
         return self.reports.compare(minimum_reviewers)
 

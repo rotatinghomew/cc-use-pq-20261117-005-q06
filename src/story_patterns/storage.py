@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS adjudications (
     FOREIGN KEY(story_id, story_revision) REFERENCES stories(story_id, revision)
 );
 CREATE INDEX IF NOT EXISTS adjudications_by_story ON adjudications(story_id, story_revision, sequence);
+CREATE TABLE IF NOT EXISTS adjudication_withdrawals (
+    withdrawal_id TEXT PRIMARY KEY,
+    adjudication_id TEXT NOT NULL UNIQUE
+        REFERENCES adjudications(adjudication_id) ON DELETE RESTRICT,
+    moderator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    digest TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS withdrawals_by_adjudication
+    ON adjudication_withdrawals(adjudication_id);
 CREATE TABLE IF NOT EXISTS reports (
     report_id TEXT PRIMARY KEY,
     request_digest TEXT NOT NULL,
@@ -144,7 +155,7 @@ class StoryStore:
             ).fetchall()
         return [dict(row) | {"evidence_event_ids": json.loads(row["evidence_event_ids"])} for row in rows]
 
-    def decision_history(self, story_id: str, revision: int) -> tuple[list[dict], list[dict]]:
+    def decision_history(self, story_id: str, revision: int) -> tuple[list[dict], list[dict], list[dict]]:
         with self.read_connection() as connection:
             votes = connection.execute(
                 "SELECT * FROM decisions WHERE story_id=? AND story_revision=? ORDER BY annotator, sequence",
@@ -154,10 +165,46 @@ class StoryStore:
                 "SELECT * FROM adjudications WHERE story_id=? AND story_revision=? ORDER BY sequence",
                 (story_id, revision),
             ).fetchall()
+            withdrawals = connection.execute(
+                "SELECT w.* FROM adjudication_withdrawals w "
+                "JOIN adjudications a ON a.adjudication_id=w.adjudication_id "
+                "WHERE a.story_id=? AND a.story_revision=? "
+                "ORDER BY a.sequence, w.recorded_at, w.withdrawal_id",
+                (story_id, revision),
+            ).fetchall()
         return (
             [dict(row) | {"evidence_event_ids": json.loads(row["evidence_event_ids"])} for row in votes],
             [dict(row) | {"evidence_event_ids": json.loads(row["evidence_event_ids"])} for row in adjudications],
+            [dict(row) for row in withdrawals],
         )
+
+    def active_adjudication(self, story_id: str, revision: int) -> dict | None:
+        with self.read_connection() as connection:
+            record = self._latest_adjudication(connection, story_id, revision)
+        if record is None:
+            return None
+        return record | {"evidence_event_ids": json.loads(record["evidence_event_ids"])}
+
+    @staticmethod
+    def _latest_adjudication(connection: sqlite3.Connection, story_id: str, revision: int) -> dict | None:
+        """Return the latest adjudication only while it remains in force.
+
+        A withdrawal never promotes an older, already-superseded conclusion: the
+        latest adjudication governs its story revision, and withdrawing it leaves
+        that revision without a moderator conclusion until a new one is recorded.
+        """
+        row = connection.execute(
+            "SELECT a.*, w.withdrawal_id AS withdrawal_id FROM adjudications a "
+            "LEFT JOIN adjudication_withdrawals w ON w.adjudication_id=a.adjudication_id "
+            "WHERE a.story_id=? AND a.story_revision=? "
+            "ORDER BY a.sequence DESC LIMIT 1",
+            (story_id, revision),
+        ).fetchone()
+        if row is None or row["withdrawal_id"] is not None:
+            return None
+        record = dict(row)
+        record.pop("withdrawal_id")
+        return record
 
     def latest_decisions_for_stories(self, identities: list[tuple[str, int]]) -> dict[tuple[str, int], list[dict]]:
         result = {}
@@ -165,7 +212,9 @@ class StoryStore:
             result[(story_id, revision)] = self.latest_decisions(story_id, revision)
         return result
 
-    def analysis_snapshot(self, tradition: str | None) -> tuple[list[dict], dict, dict, dict]:
+    def analysis_snapshot(
+        self, tradition: str | None
+    ) -> tuple[list[dict], dict, dict, dict, dict]:
         with self.read_connection() as connection:
             connection.execute("BEGIN")
             if tradition is None:
@@ -180,6 +229,7 @@ class StoryStore:
             identities = [(item["story_id"], item["revision"]) for item in stories]
             decisions = {}
             adjudications = {}
+            withdrawn = {}
             for story_id, revision in identities:
                 latest = connection.execute(
                     "SELECT d.* FROM decisions d JOIN ("
@@ -192,13 +242,26 @@ class StoryStore:
                 decisions[(story_id, revision)] = [
                     dict(row) | {"evidence_event_ids": json.loads(row["evidence_event_ids"])} for row in latest
                 ]
-                adjudication = connection.execute(
-                    "SELECT * FROM adjudications WHERE story_id=? AND story_revision=? "
-                    "ORDER BY sequence DESC LIMIT 1", (story_id, revision)
+                adjudications[(story_id, revision)] = self._latest_adjudication(
+                    connection, story_id, revision
+                )
+                if adjudications[(story_id, revision)] is not None:
+                    adjudications[(story_id, revision)] = adjudications[(story_id, revision)] | {
+                        "evidence_event_ids": json.loads(adjudications[(story_id, revision)]["evidence_event_ids"])
+                    }
+                latest_adjudication = connection.execute(
+                    "SELECT a.*, w.withdrawal_id AS withdrawal_id, w.reason AS withdrawal_reason, "
+                    "w.moderator AS withdrawal_moderator, w.recorded_at AS withdrawal_recorded_at "
+                    "FROM adjudications a "
+                    "LEFT JOIN adjudication_withdrawals w ON w.adjudication_id=a.adjudication_id "
+                    "WHERE a.story_id=? AND a.story_revision=? ORDER BY a.sequence DESC LIMIT 1",
+                    (story_id, revision),
                 ).fetchone()
-                adjudications[(story_id, revision)] = (
-                    dict(adjudication) | {"evidence_event_ids": json.loads(adjudication["evidence_event_ids"])}
-                    if adjudication else None
+                withdrawn[(story_id, revision)] = (
+                    dict(latest_adjudication) | {
+                        "evidence_event_ids": json.loads(latest_adjudication["evidence_event_ids"])
+                    }
+                    if latest_adjudication and latest_adjudication["withdrawal_id"] is not None else None
                 )
             origins = {identity: [] for identity in identities}
             if identities:
@@ -209,7 +272,7 @@ class StoryStore:
                     identity = (row["story_id"], row["revision"])
                     if identity in origins:
                         origins[identity].append(row["batch_id"])
-        return stories, decisions, origins, adjudications
+        return stories, decisions, origins, adjudications, withdrawn
 
     def catalog_manifest(self) -> tuple[list[dict], list[dict]]:
         with self.read_connection() as connection:
@@ -233,6 +296,8 @@ class StoryStore:
                 "decisions": [dict(row) for row in connection.execute("SELECT * FROM decisions ORDER BY decision_id")],
                 "adjudications": [dict(row) for row in connection.execute(
                     "SELECT * FROM adjudications ORDER BY adjudication_id")],
+                "adjudication_withdrawals": [dict(row) for row in connection.execute(
+                    "SELECT * FROM adjudication_withdrawals ORDER BY withdrawal_id")],
                 "reports": [dict(row) for row in connection.execute("SELECT * FROM reports ORDER BY report_id")],
             }
 

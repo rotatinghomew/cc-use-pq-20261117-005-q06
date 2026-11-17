@@ -36,6 +36,11 @@ def render_report(report: dict) -> str:
     coverage = report["coverage"]["pattern"]
     lines.extend(_table([{"status": key, "count": value} for key, value in coverage.items()],
                         [("status", "Pattern review status"), ("count", "Stories")]))
+    if report.get("withdrawn_adjudications"):
+        lines.extend(["", "## Withdrawn adjudications", "",
+                      "These conclusions were retracted and do not count as final results:", ""])
+        lines.extend(_table([{"adjudication_id": value} for value in report["withdrawn_adjudications"]],
+                            [("adjudication_id", "Adjudication")]))
     lines.extend(["", "## Provenance", "", "Story revisions and decision IDs used:", "",
                   "```json", json.dumps(report["provenance"], ensure_ascii=False, indent=2), "```", ""])
     return "\n".join(lines)

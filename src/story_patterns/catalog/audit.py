@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from story_patterns.catalog.validate import digest_json, normalize_story
 from story_patterns.errors import ValidationError
-from story_patterns.review.adjudication import normalize_adjudication
+from story_patterns.review.adjudication import normalize_adjudication, normalize_withdrawal
 from story_patterns.review.validate import normalize_decision
 
 
@@ -74,9 +74,30 @@ def audit_catalog(snapshot: dict) -> dict:
                 issues.append(_issue("adjudication", row["adjudication_id"], "stored digest does not match content"))
         except (json.JSONDecodeError, ValidationError, TypeError) as error:
             issues.append(_issue("adjudication", row["adjudication_id"], f"invalid adjudication: {error}"))
+    withdrawn_ids = set()
+    for row in snapshot.get("adjudication_withdrawals", []):
+        try:
+            normalized = normalize_withdrawal({
+                "withdrawal_id": row["withdrawal_id"], "adjudication_id": row["adjudication_id"],
+                "moderator": row["moderator"], "reason": row["reason"], "recorded_at": row["recorded_at"],
+            })
+            if digest_json(normalized) != row["digest"]:
+                issues.append(_issue("withdrawal", row["withdrawal_id"],
+                                     "stored withdrawal digest does not match content"))
+        except ValidationError as error:
+            issues.append(_issue("withdrawal", row["withdrawal_id"], f"invalid withdrawal: {error}"))
+        if row["adjudication_id"] in withdrawn_ids:
+            issues.append(_issue("withdrawal", row["withdrawal_id"],
+                                 "adjudication is withdrawn more than once"))
+        withdrawn_ids.add(row["adjudication_id"])
+        if row["adjudication_id"] not in {item["adjudication_id"] for item in snapshot["adjudications"]}:
+            issues.append(_issue("withdrawal", row["withdrawal_id"],
+                                 "references missing adjudication"))
     story_keys = {f"{story_id}@{revision}" for story_id, revision in stories}
     decision_ids = {row["decision_id"] for row in snapshot["decisions"]}
     adjudication_ids = {row["adjudication_id"] for row in snapshot["adjudications"]}
+    withdrawal_ids = {row["withdrawal_id"] for row in snapshot.get("adjudication_withdrawals", [])}
+    withdrawn_adjudication_ids = {row["adjudication_id"] for row in snapshot.get("adjudication_withdrawals", [])}
     for row in snapshot["reports"]:
         try:
             document = json.loads(row["document"])
@@ -91,6 +112,8 @@ def audit_catalog(snapshot: dict) -> dict:
                 issues.append(_issue("report", row["report_id"], "references missing reader decisions"))
             if not set(provenance["adjudication_ids"]).issubset(adjudication_ids):
                 issues.append(_issue("report", row["report_id"], "references missing adjudications"))
+            if not set(provenance.get("withdrawn_adjudication_ids", [])).issubset(withdrawn_adjudication_ids):
+                issues.append(_issue("report", row["report_id"], "references adjudications not withdrawn"))
             for identity, batch_ids in provenance.get("batch_ids_by_story", {}).items():
                 if identity not in story_keys or not set(batch_ids).issubset(batch_rows):
                     issues.append(_issue("report", row["report_id"], "references missing batch provenance"))
@@ -101,6 +124,7 @@ def audit_catalog(snapshot: dict) -> dict:
             "batches_checked": len(snapshot["batches"]), "decisions_checked": len(snapshot["decisions"]),
             "batch_links_checked": len(snapshot["batch_stories"]),
             "adjudications_checked": len(snapshot["adjudications"]), "reports_checked": len(snapshot["reports"]),
+            "withdrawals_checked": len(snapshot.get("adjudication_withdrawals", [])),
             "issue_count": len(issues), "issues": issues}
 
 

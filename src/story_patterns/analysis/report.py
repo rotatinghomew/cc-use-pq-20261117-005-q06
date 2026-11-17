@@ -28,7 +28,7 @@ def _consensus(votes: list[str], minimum: int) -> tuple[str | None, str]:
 
 def build_report(stories: list[dict], decisions: dict[tuple[str, int], list[dict]],
                  tradition: str | None, minimum: int, origins: dict | None = None,
-                 adjudications: dict | None = None) -> dict[str, Any]:
+                 adjudications: dict | None = None, withdrawn: dict | None = None) -> dict[str, Any]:
     pattern_counts: Counter = Counter()
     outcome_counts: Counter = Counter()
     final_pattern_counts: Counter = Counter()
@@ -44,7 +44,14 @@ def build_report(stories: list[dict], decisions: dict[tuple[str, int], list[dict
         pattern, pattern_status = _consensus([item["pattern"] for item in votes], minimum)
         outcome, outcome_status = _consensus([item["youngest_outcome"] for item in votes], minimum)
         adjudication = (adjudications or {}).get(identity)
-        resolution_counts["adjudicated" if adjudication else "reader_consensus"] += 1
+        withdrawal = (withdrawn or {}).get(identity)
+        if adjudication:
+            resolution = "adjudicated"
+        elif withdrawal:
+            resolution = "withdrawn"
+        else:
+            resolution = "reader_consensus"
+        resolution_counts[resolution] += 1
         pattern_coverage[pattern_status] += 1
         outcome_coverage[outcome_status] += 1
         if pattern is not None:
@@ -64,10 +71,12 @@ def build_report(stories: list[dict], decisions: dict[tuple[str, int], list[dict
             "pattern": pattern, "pattern_status": pattern_status,
             "youngest_outcome": outcome, "outcome_status": outcome_status,
             "final_pattern": final_pattern, "final_outcome": final_outcome,
-            "resolution": "adjudicated" if adjudication else "reader_consensus",
+            "resolution": resolution,
             "adjudication_id": adjudication["adjudication_id"] if adjudication else None,
             "adjudication_rationale": adjudication["rationale"] if adjudication else None,
             "adjudication_evidence_event_ids": adjudication["evidence_event_ids"] if adjudication else [],
+            "withdrawn_adjudication_id": withdrawal["adjudication_id"] if withdrawal else None,
+            "withdrawal_reason": withdrawal["withdrawal_reason"] if withdrawal else None,
             "reviewer_count": len(votes),
         })
     return {
@@ -84,8 +93,11 @@ def build_report(stories: list[dict], decisions: dict[tuple[str, int], list[dict
         "final_pattern_counts": dict(sorted(final_pattern_counts.items())),
         "final_outcome_counts": dict(sorted(final_outcome_counts.items())),
         "adjudicated_story_revisions": sum(value is not None for value in (adjudications or {}).values()),
+        "withdrawn_adjudications": sorted(
+            value["adjudication_id"] for value in (withdrawn or {}).values() if value
+        ),
         "resolution_counts": {key: resolution_counts.get(key, 0)
-                              for key in ("reader_consensus", "adjudicated")},
+                              for key in ("reader_consensus", "adjudicated", "withdrawn")},
         "story_results": story_results,
         "reviewer_agreement": pairwise_agreement(decisions),
         "evidence_coverage": evidence_coverage(stories, decisions),
@@ -100,6 +112,9 @@ def build_report(stories: list[dict], decisions: dict[tuple[str, int], list[dict
             "story_revisions": [f"{item['story_id']}@{item['revision']}" for item in stories],
             "decision_ids": sorted(used_decisions),
             "adjudication_ids": sorted(value["adjudication_id"] for value in (adjudications or {}).values() if value),
+            "withdrawn_adjudication_ids": sorted(
+                value["adjudication_id"] for value in (withdrawn or {}).values() if value
+            ),
             "batch_ids_by_story": {
                 f"{story_id}@{revision}": sorted(batch_ids)
                 for (story_id, revision), batch_ids in sorted((origins or {}).items())
@@ -116,9 +131,9 @@ class ReportService:
         from story_patterns.analysis.cohorts import select_cohort, validate_minimum
 
         minimum = validate_minimum(minimum)
-        stories, decisions, origins, adjudications = self.store.analysis_snapshot(tradition)
+        stories, decisions, origins, adjudications, withdrawn = self.store.analysis_snapshot(tradition)
         stories = select_cohort(stories, tradition)
-        result = build_report(stories, decisions, tradition, minimum, origins, adjudications)
+        result = build_report(stories, decisions, tradition, minimum, origins, adjudications, withdrawn)
         report_id = digest_json(result)[:24]
         request_digest = digest_json({"criteria": result["criteria"], "provenance": result["provenance"]})
         document = canonical_json({"report_id": report_id, **result})
@@ -140,5 +155,5 @@ class ReportService:
         from story_patterns.analysis.comparison import compare_traditions
 
         minimum = validate_minimum(minimum)
-        stories, decisions, _origins, adjudications = self.store.analysis_snapshot(None)
-        return compare_traditions(stories, decisions, minimum, adjudications)
+        stories, decisions, _origins, adjudications, withdrawn = self.store.analysis_snapshot(None)
+        return compare_traditions(stories, decisions, minimum, adjudications, withdrawn)

@@ -41,7 +41,7 @@ def export_csv(report: dict, path: str | Path, overwrite: bool = False) -> Path:
     buffer = StringIO(newline="")
     columns = ["story_id", "revision", "title", "tradition", "pattern", "pattern_status",
                "youngest_outcome", "outcome_status", "final_pattern", "final_outcome",
-               "resolution", "adjudication_id", "reviewer_count"]
+               "resolution", "adjudication_id", "withdrawn_adjudication_id", "reviewer_count"]
     writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
     writer.writeheader()
     for row in report["story_results"]:
